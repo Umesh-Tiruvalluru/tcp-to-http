@@ -19,3 +19,14 @@ end
 
 [x] Initialize a new Go module for your project: go mod init MODULE_NAME
 [x] Create a new main.go file at the root. For now, it should simply print out the string "I hope I get the job!".
+
+#### ASSIGNMENT 2
+
+[x]Remove the printing of "I hope I get the job!".
+[]Instead, your program will now read messages.txt 8 bytes at a time and print that data back to stdout in 8 byte chunks. Here's some pseudocode:
+
+os.Open messages.txt for reading.
+While there is still data in the file:
+Read 8 bytes from the file into a slice of bytes.
+Print the 8 bytes as text to stdout in this format: read: %s\n
+When you finally get an io.EOF error, exit the program.
