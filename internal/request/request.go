@@ -4,123 +4,176 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
+
+	"github.com/Umesh-Tiruvalluru/httpfromtcp/internal/headers"
 )
 
-type parserState string
+type StateParser int
 
+const (
+	StateParserRequestLine StateParser = iota
+	StateParserHeader
+	StateParserBody
+	StateParserDone
+)
 
 type RequestLine struct {
 	Method        string
-	RequestTarget string // path
+	RequestTarget string
 	HTTPVersion   string
 }
 
-
 type Request struct {
 	RequestLine RequestLine
-	state       parserState
-	// Headers map[string]string
-	// Body []byte
+	Headers     *headers.Headers
+	Body 		[]byte
+
+	State       StateParser
 }
 
 var (
-	ErrorMalformedRequestLine = fmt.Errorf("malformed request line")
-	ErrorUnsupportedHTTPVersion = fmt.Errorf("unsupported http version")
+	ErrorMalformedRequestLine   = fmt.Errorf("malformed request line")
+	ErrorUnsupportedHttpVersion = fmt.Errorf("unsupported http verison, only supports 1.1 version")
+	ErrUnexpectedEOF            = fmt.Errorf("unexpected end of file")
 )
 
-const (
-	StateInit parserState = "Init"
-	StateDone parserState = "Done"
-)
+var crlf = []byte("\r\n")
 
-var CRLF = []byte("\r\n")
-
-// ParseRequestLine takes a string representing the request line and parses it into a RequestLine struct.
-func ParseRequestLine(data []byte) (RequestLine, int, error) {
-	idx := bytes.Index(data, CRLF)
+func parseRequestLine(data []byte) (RequestLine, int, error) {
+	idx := bytes.Index(data, crlf)
 	if idx == -1 {
-		return  RequestLine{}, 0, nil
+		return RequestLine{}, 0, nil
 	}
 
 	requestLine := string(data[:idx])
-	consumedBytes := idx+len(CRLF)
+	numBytesRead := idx + len(crlf)
 
-	parts := strings.Split(requestLine, " ")
-	
-	if len(parts) != 3 {
-		return  RequestLine{}, consumedBytes, ErrorMalformedRequestLine
+	requestLineParts := strings.Split(requestLine, " ")
+	if len(requestLineParts) != 3 {
+		return RequestLine{}, numBytesRead, ErrorMalformedRequestLine
 	}
 
-	httpParts := strings.Split(parts[2], "/")
-	if len(httpParts) != 2 || httpParts[0] != "HTTP" || httpParts[1] != "1.1" {
-		return RequestLine{}, consumedBytes, ErrorUnsupportedHTTPVersion
+	httpVersionParts := strings.Split(requestLineParts[2], "/")
+	if len(httpVersionParts) != 2 || httpVersionParts[0] != "HTTP" || httpVersionParts[1] != "1.1" {
+		return RequestLine{}, numBytesRead, ErrorUnsupportedHttpVersion
 	}
 
 	return RequestLine{
-		Method: parts[0],
-		RequestTarget: parts[1],
-		HTTPVersion: httpParts[1],
-	}, consumedBytes, nil
+		Method:        requestLineParts[0],
+		RequestTarget: requestLineParts[1],
+		HTTPVersion:   httpVersionParts[1],
+	}, numBytesRead, nil
 }
 
+func parseBody(data []byte, contentLength int) ([]byte, int, error) {
+    if len(data) < contentLength {
+        return nil, 0, nil  
+    }
 
-func (r *Request) parse(data []byte) (int, error) {
-	switch r.state {
-	case StateInit:
-		requestLine, consumedBytes, err := ParseRequestLine(data)
+    body := make([]byte, contentLength)
+    copy(body, data[:contentLength])
+    return body, contentLength, nil
+}
+
+func (r *Request) ParseRequest(buf []byte) (int, error) {
+	switch r.State {
+	case StateParserRequestLine:
+		requestLine, numBytesRead, err := parseRequestLine(buf)
 		if err != nil {
 			return 0, err
 		}
-		if requestLine.Method == "" {
-			return consumedBytes, nil
+
+		if numBytesRead == 0 {
+			return 0, nil
 		}
+
 		r.RequestLine = requestLine
-		r.state = StateDone
-		return consumedBytes, nil
-	default:
-		panic("invalid state")
-	}
-}
+		r.State = StateParserHeader
 
-// RequestFromReader reads from the provided reader and constructs a Request struct.
-func RequestFromReader(reader io.Reader) (*Request, error) {
+		return numBytesRead, nil
 
-	request := &Request{
-		state: StateInit,
-	}
-
-
-	buf := make([]byte, 1024) // buffer to hold incoming data
-	bufLen := 0 // number of bytes currently in the buffer
-
-	for request.state != StateDone{
-		n, err := reader.Read(buf[bufLen:])
+	case StateParserHeader:
+		numBytesRead, done, err := r.Headers.ParseHeader(buf)
 		if err != nil {
-			if err == io.EOF {
-				return nil, fmt.Errorf("unexpected EOF")
-			}
-			return nil, err
+			return 0, err
 		}
 
-		if n > 0 {
-			bufLen += n
-			_, err := request.parse(buf[:bufLen])
-			if err != nil {
-				return nil, err
-			}
+		if numBytesRead == 0 {
+			return 0, nil
 		}
 
+		if done {
+			r.State = StateParserBody
+		}
+
+		return numBytesRead, nil
+
+case StateParserBody:
+    contentLengthStr := r.Headers.Get("Content-Length")
+    if contentLengthStr == "" {
+        r.State = StateParserDone
+        return 0, nil
+    }
+
+    contentLength, err := strconv.Atoi(strings.TrimSpace(contentLengthStr))
+    if err != nil {
+        return 0, fmt.Errorf("invalid Content-Length: %w", err)
+    }
+
+    body, numBytesRead, err := parseBody(buf, contentLength)
+    if err != nil {
+        return 0, err
+    }
+
+    if numBytesRead == 0 {
+        return 0, nil  // not enough data yet
+    }
+
+    r.Body = body
+    r.State = StateParserDone
+    return numBytesRead, nil
 	}
 
-	return request, nil
+	return 0, nil
 }
 
+func RequestFromReader(conn io.Reader) (*Request, error) {
+    request := Request{
+        State:   StateParserRequestLine,
+        Headers: headers.NewHeaders(),
+    }
 
+    buf := make([]byte, 4096)
+    bufLen := 0
 
-/* 
-- Read from reader until we have a full request line (ending with CRLF)
-	- function ReadFromReader (reader buf.Reader) (*Request, error) 
-	- function ParseRequestLine (line string) (RequestLine, error)
-	- function (r *Request) parse() string
-*/
+    for request.State != StateParserDone {
+        n, readErr := conn.Read(buf[bufLen:])
+        bufLen += n
+
+        for bufLen > 0 {
+            numBytesRead, err := request.ParseRequest(buf[:bufLen])
+            if err != nil {
+                return nil, err
+            }
+            if numBytesRead == 0 {
+                break
+            }
+            copy(buf, buf[numBytesRead:bufLen])
+            bufLen -= numBytesRead
+        }
+
+        if readErr != nil {
+            if readErr == io.EOF {
+                if request.State != StateParserDone {
+                    return nil, ErrUnexpectedEOF
+                }
+                break
+            }
+            return nil, readErr
+        }
+    }
+
+    return &request, nil
+}
