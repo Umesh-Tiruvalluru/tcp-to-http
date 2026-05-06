@@ -31,6 +31,10 @@ func (h *Headers) Set(name, value string) {
     }
 }
 
+func (h Headers) Map() map[string]string {
+    return h.Headers
+}
+
 
 func isValid (name string) bool {
 	for _, char := range name {
@@ -77,3 +81,4 @@ func (h *Headers) ParseHeader(data []byte) (int, bool, error) {
 	h.Set(name, value)
 	return numByteRead, false, nil
 }
+
